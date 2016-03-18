@@ -34,7 +34,6 @@
 #include <ck_cc.h>
 #include <ck_md.h>
 #include <ck_stdint.h>
-#include <stdbool.h>
 
 /*
  * The following represent supported atomic operations.
@@ -88,6 +87,7 @@ CK_PR_FENCE(store_load, "mfence")
 CK_PR_FENCE(memory, "mfence")
 CK_PR_FENCE(release, "mfence")
 CK_PR_FENCE(acquire, "mfence")
+CK_PR_FENCE(acqrel, "mfence")
 CK_PR_FENCE(lock, "mfence")
 CK_PR_FENCE(unlock, "mfence")
 

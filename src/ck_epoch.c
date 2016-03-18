@@ -35,7 +35,8 @@
 #include <ck_epoch.h>
 #include <ck_pr.h>
 #include <ck_stack.h>
-#include <stdbool.h>
+#include <ck_stdbool.h>
+#include <ck_string.h>
 
 /*
  * Only three distinct values are used for reclamation, but reclamation occurs
@@ -136,6 +137,87 @@ CK_STACK_CONTAINER(struct ck_epoch_record, record_next,
 CK_STACK_CONTAINER(struct ck_epoch_entry, stack_entry,
     ck_epoch_entry_container)
 
+#define CK_EPOCH_SENSE_MASK	(CK_EPOCH_SENSE - 1)
+
+void
+_ck_epoch_delref(struct ck_epoch_record *record,
+    struct ck_epoch_section *section)
+{
+	struct ck_epoch_ref *current, *other;
+	unsigned int i = section->bucket;
+
+	current = &record->local.bucket[i];
+	current->count--;
+
+	if (current->count > 0)
+		return;
+
+	/*
+	 * If the current bucket no longer has any references, then
+	 * determine whether we have already transitioned into a newer
+	 * epoch. If so, then make sure to update our shared snapshot
+	 * to allow for forward progress.
+	 *
+	 * If no other active bucket exists, then the record will go
+	 * inactive in order to allow for forward progress.
+	 */
+	other = &record->local.bucket[(i + 1) &
+	    CK_EPOCH_SENSE_MASK];
+	if (other->count > 0 &&
+	    ((int)(current->epoch - other->epoch) < 0)) {
+		/*
+		 * The other epoch value is actually the newest,
+		 * transition to it.
+		 */
+		ck_pr_store_uint(&record->epoch, other->epoch);
+	}
+
+	return;
+}
+
+void
+_ck_epoch_addref(struct ck_epoch_record *record,
+    struct ck_epoch_section *section)
+{
+	struct ck_epoch *global = record->global;
+	struct ck_epoch_ref *ref;
+	unsigned int epoch, i;
+
+	epoch = ck_pr_load_uint(&global->epoch);
+	i = epoch & CK_EPOCH_SENSE_MASK;
+	ref = &record->local.bucket[i];
+
+	if (ref->count++ == 0) {
+#ifndef CK_MD_TSO
+		struct ck_epoch_ref *previous;
+
+		/*
+		 * The system has already ticked. If another non-zero bucket
+		 * exists, make sure to order our observations with respect
+		 * to it. Otherwise, it is possible to acquire a reference
+		 * from the previous epoch generation.
+		 *
+		 * On TSO architectures, the monoticity of the global counter
+		 * and load-{store, load} ordering are sufficient to guarantee
+		 * this ordering.
+		 */
+		previous = &record->local.bucket[(i + 1) &
+		    CK_EPOCH_SENSE_MASK];
+		if (previous->count > 0)
+			ck_pr_fence_acqrel();
+#endif /* !CK_MD_TSO */
+
+		/*
+		 * If this is this is a new reference into the current
+		 * bucket then cache the associated epoch value.
+		 */
+		ref->epoch = epoch;
+	}
+
+	section->bucket = i;
+	return;
+}
+
 void
 ck_epoch_init(struct ck_epoch *global)
 {
@@ -180,12 +262,14 @@ ck_epoch_register(struct ck_epoch *global, struct ck_epoch_record *record)
 {
 	size_t i;
 
+	record->global = global;
 	record->state = CK_EPOCH_STATE_USED;
 	record->active = 0;
 	record->epoch = 0;
 	record->n_dispatch = 0;
 	record->n_peak = 0;
 	record->n_pending = 0;
+	memset(&record->local, 0, sizeof record->local);
 
 	for (i = 0; i < CK_EPOCH_LENGTH; i++)
 		ck_stack_init(&record->pending[i]);
@@ -196,8 +280,9 @@ ck_epoch_register(struct ck_epoch *global, struct ck_epoch_record *record)
 }
 
 void
-ck_epoch_unregister(struct ck_epoch *global, struct ck_epoch_record *record)
+ck_epoch_unregister(struct ck_epoch_record *record)
 {
+	struct ck_epoch *global = record->global;
 	size_t i;
 
 	record->active = 0;
@@ -205,6 +290,7 @@ ck_epoch_unregister(struct ck_epoch *global, struct ck_epoch_record *record)
 	record->n_dispatch = 0;
 	record->n_peak = 0;
 	record->n_pending = 0;
+	memset(&record->local, 0, sizeof record->local);
 
 	for (i = 0; i < CK_EPOCH_LENGTH; i++)
 		ck_stack_init(&record->pending[i]);
@@ -298,31 +384,33 @@ ck_epoch_reclaim(struct ck_epoch_record *record)
  * This function must not be called with-in read section.
  */
 void
-ck_epoch_synchronize(struct ck_epoch *global, struct ck_epoch_record *record)
+ck_epoch_synchronize(struct ck_epoch_record *record)
 {
+	struct ck_epoch *global = record->global;
 	struct ck_epoch_record *cr;
 	unsigned int delta, epoch, goal, i;
 	bool active;
 
+	ck_pr_fence_memory();
+
 	/*
-	 * Technically, we are vulnerable to an overflow in presence of
-	 * multiple writers. Realistically, this will require 2^32 scans. You
-	 * can use epoch-protected sections on the writer-side if this is a
-	 * concern.
+	 * The observation of the global epoch must be ordered with respect to
+	 * all prior operations. The re-ordering of loads is permitted given
+	 * monoticity of global epoch counter.
+	 *
+	 * If UINT_MAX concurrent mutations were to occur then it is possible
+	 * to encounter an ABA-issue. If this is a concern, consider tuning
+	 * write-side concurrency.
 	 */
 	delta = epoch = ck_pr_load_uint(&global->epoch);
 	goal = epoch + CK_EPOCH_GRACE;
 
-	/*
-	 * Guarantee any mutations previous to the barrier will be made visible
-	 * with respect to epoch snapshots we will read.
-	 */
-	ck_pr_fence_memory();
-
 	for (i = 0, cr = NULL; i < CK_EPOCH_GRACE - 1; cr = NULL, i++) {
+		bool r;
+
 		/*
 		 * Determine whether all threads have observed the current
-		 * epoch.  We can get away without a fence here.
+		 * epoch with respect to the updates on invocation.
 		 */
 		while (cr = ck_epoch_scan(global, cr, delta, &active),
 		    cr != NULL) {
@@ -332,7 +420,7 @@ ck_epoch_synchronize(struct ck_epoch *global, struct ck_epoch_record *record)
 
 			/*
 			 * Another writer may have already observed a grace
- 			 * period.
+			 * period.
 			 */
 			e_d = ck_pr_load_uint(&global->epoch);
 			if (e_d != delta) {
@@ -359,11 +447,18 @@ ck_epoch_synchronize(struct ck_epoch *global, struct ck_epoch_record *record)
 		 * it is possible to overflow the epoch value if we apply
 		 * modulo-3 arithmetic.
 		 */
-		if (ck_pr_cas_uint_value(&global->epoch, delta, delta + 1,
-		    &delta) == true) {
-			delta = delta + 1;
-			continue;
-		}
+		r = ck_pr_cas_uint_value(&global->epoch, delta, delta + 1,
+		    &delta);
+
+		/* Order subsequent thread active checks. */
+		ck_pr_fence_atomic_load();
+
+		/*
+		 * If CAS has succeeded, then set delta to latest snapshot.
+		 * Otherwise, we have just acquired latest snapshot.
+		 */
+		delta = delta + r;
+		continue;
 
 reload:
 		if ((goal > epoch) & (delta >= goal)) {
@@ -379,15 +474,21 @@ reload:
 		}
 	}
 
+	/*
+	 * A majority of use-cases will not require full barrier semantics.
+	 * However, if non-temporal instructions are used, full barrier
+	 * semantics are necessary.
+	 */
+	ck_pr_fence_memory();
 	record->epoch = delta;
 	return;
 }
 
 void
-ck_epoch_barrier(struct ck_epoch *global, struct ck_epoch_record *record)
+ck_epoch_barrier(struct ck_epoch_record *record)
 {
 
-	ck_epoch_synchronize(global, record);
+	ck_epoch_synchronize(record);
 	ck_epoch_reclaim(record);
 	return;
 }
@@ -403,12 +504,15 @@ ck_epoch_barrier(struct ck_epoch *global, struct ck_epoch_record *record)
  * is far from ideal too.
  */
 bool
-ck_epoch_poll(struct ck_epoch *global, struct ck_epoch_record *record)
+ck_epoch_poll(struct ck_epoch_record *record)
 {
 	bool active;
-	struct ck_epoch_record *cr = NULL;
-	unsigned int epoch = ck_pr_load_uint(&global->epoch);
+	unsigned int epoch;
 	unsigned int snapshot;
+	struct ck_epoch_record *cr = NULL;
+	struct ck_epoch *global = record->global;
+
+	epoch = ck_pr_load_uint(&global->epoch);
 
 	/* Serialize epoch snapshots with respect to global epoch. */
 	ck_pr_fence_memory();

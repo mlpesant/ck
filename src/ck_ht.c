@@ -38,8 +38,8 @@
 #include <ck_md.h>
 #include <ck_pr.h>
 #include <ck_stdint.h>
-#include <stdbool.h>
-#include <string.h>
+#include <ck_stdbool.h>
+#include <ck_string.h>
 
 #include "ck_ht_hash.h"
 #include "ck_internal.h"
@@ -112,7 +112,7 @@ ck_ht_hash(struct ck_ht_hash *h,
     uint16_t key_length)
 {
 
-	h->value = MurmurHash64A(key, key_length, table->seed);
+	table->h(h, key, key_length, table->seed);
 	return;
 }
 

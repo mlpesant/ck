@@ -27,6 +27,8 @@
 #if defined(__linux__) && defined(__KERNEL__)
 #include <linux/kernel.h>
 #include <linux/types.h>
+#elif defined(__FreeBSD__) && defined(_KERNEL)
+#include <sys/stdint.h>
 #else
 #include <stdint.h>
 #endif /* __linux__ && __KERNEL__ */

@@ -89,6 +89,7 @@ read_thread(void *unused CK_CC_UNUSED)
 	ck_epoch_record_t record CK_CC_CACHELINE;
 	ck_stack_entry_t *cursor;
 	ck_stack_entry_t *n;
+	unsigned int i;
 
 	ck_epoch_register(&stack_epoch, &record);
 
@@ -109,15 +110,20 @@ read_thread(void *unused CK_CC_UNUSED)
 
 	j = 0;
 	for (;;) {
-		ck_epoch_begin(&stack_epoch, &record);
+		i = 0;
+
+		ck_epoch_begin(&record, NULL);
 		CK_STACK_FOREACH(&stack, cursor) {
 			if (cursor == NULL)
 				continue;
 
 			n = CK_STACK_NEXT(cursor);
 			j += ck_pr_load_ptr(&n) != NULL;
+
+			if (i++ > 4098)
+				break;
 		}
-		ck_epoch_end(&stack_epoch, &record);
+		ck_epoch_end(&record, NULL);
 
 		if (j != 0 && ck_pr_load_uint(&readers) == 0)
 			ck_pr_store_uint(&readers, 1);
@@ -173,39 +179,32 @@ write_thread(void *unused CK_CC_UNUSED)
 		while (ck_pr_load_uint(&readers) == 0)
 			ck_pr_stall();
 
-		if (tid == 0) {
-			fprintf(stderr, "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b[W] %2.2f: %c",
-			    (double)j / ITERATE_S, animate[i % strlen(animate)]);
-		}
-
 		for (i = 0; i < PAIRS_S; i++) {
-			ck_epoch_begin(&stack_epoch, &record);
+			ck_epoch_begin(&record, NULL);
 			s = ck_stack_pop_upmc(&stack);
 			e = stack_container(s);
-			ck_epoch_end(&stack_epoch, &record);
+			ck_epoch_end(&record, NULL);
 
 			if (i & 1) {
-				ck_epoch_synchronize(&stack_epoch, &record);
+				ck_epoch_synchronize(&record);
 				ck_epoch_reclaim(&record);
+				ck_epoch_call(&record, &e->epoch_entry, destructor);
 			} else {
-				ck_epoch_barrier(&stack_epoch, &record);
+				ck_epoch_barrier(&record);
+				destructor(&e->epoch_entry);
 			}
 
-			if (i & 1) {
-				ck_epoch_call(&stack_epoch, &record, &e->epoch_entry, destructor);
-			} else {
-				if (tid == 0 && i % 8192)
-					fprintf(stderr, "\b%c", animate[i % strlen(animate)]);
-
-				destructor(&e->epoch_entry);
+			if (tid == 0 && (i % 16384) == 0) {
+				fprintf(stderr, "[W] %2.2f: %c\n",
+				    (double)j / ITERATE_S, animate[i % strlen(animate)]);
 			}
 		}
 	}
 
-	ck_epoch_synchronize(&stack_epoch, &record);
+	ck_epoch_synchronize(&record);
 
 	if (tid == 0) {
-		fprintf(stderr, "\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b\b[W] Peak: %u (%2.2f%%)\n    Reclamations: %lu\n\n",
+		fprintf(stderr, "[W] Peak: %u (%2.2f%%)\n    Reclamations: %lu\n\n",
 			record.n_peak,
 			(double)record.n_peak / ((double)PAIRS_S * ITERATE_S) * 100,
 			record.n_dispatch);

@@ -37,11 +37,17 @@
 #include <ck_md.h>
 #include <ck_pr.h>
 #include <ck_stack.h>
-#include <stdbool.h>
+#include <ck_stdbool.h>
 
 #ifndef CK_EPOCH_LENGTH
 #define CK_EPOCH_LENGTH 4
 #endif
+
+/*
+ * This is used for sense detection with-respect to concurrent
+ * epoch sections.
+ */
+#define CK_EPOCH_SENSE		(2)
 
 struct ck_epoch_entry;
 typedef struct ck_epoch_entry ck_epoch_entry_t;
@@ -57,14 +63,33 @@ struct ck_epoch_entry {
 };
 
 /*
+ * A section object may be passed to every begin-end pair to allow for
+ * forward progress guarantees with-in prolonged active sections.
+ */
+struct ck_epoch_section {
+	unsigned int bucket;
+};
+typedef struct ck_epoch_section ck_epoch_section_t;
+
+/*
  * Return pointer to ck_epoch_entry container object.
  */
-#define CK_EPOCH_CONTAINER(T, M, N) CK_CC_CONTAINER(struct ck_epoch_entry, T, M, N)
+#define CK_EPOCH_CONTAINER(T, M, N) \
+	CK_CC_CONTAINER(struct ck_epoch_entry, T, M, N)
+
+struct ck_epoch_ref {
+	unsigned int epoch;
+	unsigned int count;
+};
 
 struct ck_epoch_record {
+	struct ck_epoch *global;
 	unsigned int state;
 	unsigned int epoch;
 	unsigned int active;
+	struct {
+		struct ck_epoch_ref bucket[CK_EPOCH_SENSE];
+	} local CK_CC_CACHELINE;
 	unsigned int n_pending;
 	unsigned int n_peak;
 	unsigned long n_dispatch;
@@ -82,52 +107,71 @@ struct ck_epoch {
 typedef struct ck_epoch ck_epoch_t;
 
 /*
+ * Internal functions.
+ */
+void _ck_epoch_addref(ck_epoch_record_t *, ck_epoch_section_t *);
+void _ck_epoch_delref(ck_epoch_record_t *, ck_epoch_section_t *);
+
+/*
  * Marks the beginning of an epoch-protected section.
  */
-CK_CC_INLINE static void
-ck_epoch_begin(ck_epoch_t *epoch, ck_epoch_record_t *record)
+CK_CC_FORCE_INLINE static void
+ck_epoch_begin(ck_epoch_record_t *record, ck_epoch_section_t *section)
 {
+	struct ck_epoch *epoch = record->global;
 
 	/*
 	 * Only observe new epoch if thread is not recursing into a read
 	 * section.
 	 */
 	if (record->active == 0) {
-		unsigned int g_epoch = ck_pr_load_uint(&epoch->epoch);
+		unsigned int g_epoch;
 
 		/*
 		 * It is possible for loads to be re-ordered before the store
 		 * is committed into the caller's epoch and active fields.
 		 * For this reason, store to load serialization is necessary.
 		 */
-		ck_pr_store_uint(&record->epoch, g_epoch);
-
 #if defined(CK_MD_TSO)
 		ck_pr_fas_uint(&record->active, 1);
 		ck_pr_fence_atomic_load();
 #else
 		ck_pr_store_uint(&record->active, 1);
-		ck_pr_fence_store_load();
+		ck_pr_fence_memory();
 #endif
 
-		return;
+		/*
+		 * This load is allowed to be re-ordered prior to setting
+		 * active flag due to monotonic nature of the global epoch.
+		 * However, stale values lead to measurable performance
+		 * degradation in some torture tests so we disallow early load
+		 * of global epoch.
+		 */
+		g_epoch = ck_pr_load_uint(&epoch->epoch);
+		ck_pr_store_uint(&record->epoch, g_epoch);
+	} else {
+		ck_pr_store_uint(&record->active, record->active + 1);
 	}
 
-	ck_pr_store_uint(&record->active, record->active + 1);
+	if (section != NULL)
+		_ck_epoch_addref(record, section);
+
 	return;
 }
 
 /*
  * Marks the end of an epoch-protected section.
  */
-CK_CC_INLINE static void
-ck_epoch_end(ck_epoch_t *global, ck_epoch_record_t *record)
+CK_CC_FORCE_INLINE static void
+ck_epoch_end(ck_epoch_record_t *record, ck_epoch_section_t *section)
 {
-
-	(void)global;
 
 	ck_pr_fence_release();
 	ck_pr_store_uint(&record->active, record->active - 1);
+
+	if (section != NULL)
+		_ck_epoch_delref(record, section);
+
 	return;
 }
 
@@ -136,12 +180,12 @@ ck_epoch_end(ck_epoch_t *global, ck_epoch_record_t *record)
  * argument until an epoch counter loop. This allows for a
  * non-blocking deferral.
  */
-CK_CC_INLINE static void
-ck_epoch_call(ck_epoch_t *epoch,
-	      ck_epoch_record_t *record,
+CK_CC_FORCE_INLINE static void
+ck_epoch_call(ck_epoch_record_t *record,
 	      ck_epoch_entry_t *entry,
 	      ck_epoch_cb_t *function)
 {
+	struct ck_epoch *epoch = record->global;
 	unsigned int e = ck_pr_load_uint(&epoch->epoch);
 	unsigned int offset = e & (CK_EPOCH_LENGTH - 1);
 
@@ -154,10 +198,10 @@ ck_epoch_call(ck_epoch_t *epoch,
 void ck_epoch_init(ck_epoch_t *);
 ck_epoch_record_t *ck_epoch_recycle(ck_epoch_t *);
 void ck_epoch_register(ck_epoch_t *, ck_epoch_record_t *);
-void ck_epoch_unregister(ck_epoch_t *, ck_epoch_record_t *);
-bool ck_epoch_poll(ck_epoch_t *, ck_epoch_record_t *);
-void ck_epoch_synchronize(ck_epoch_t *, ck_epoch_record_t *);
-void ck_epoch_barrier(ck_epoch_t *, ck_epoch_record_t *);
+void ck_epoch_unregister(ck_epoch_record_t *);
+bool ck_epoch_poll(ck_epoch_record_t *);
+void ck_epoch_synchronize(ck_epoch_record_t *);
+void ck_epoch_barrier(ck_epoch_record_t *);
 void ck_epoch_reclaim(ck_epoch_record_t *);
 
 #endif /* CK_EPOCH_H */
